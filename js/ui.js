@@ -102,7 +102,7 @@ export function numberIcon(n, kind = 'stop') {
 }
 
 export function placeIcon(kind) {
-  const label = { home: '🏠', dump: '🗑️' }[kind] || '•';
+  const label = { home: '🏠', dump: '🗑️', break: '☕' }[kind] || '•';
   return L.divIcon({ className: '', html: `<div class="pin pin-place">${label}</div>`, iconSize: [30, 30], iconAnchor: [15, 15] });
 }
 

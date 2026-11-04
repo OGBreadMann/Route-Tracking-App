@@ -14,6 +14,7 @@ const state = {
   points: [],         // recorded points for the active run
   fix: null,          // latest GPS fix (even if not recorded)
   watchId: null,
+  newSegment: false,  // next recorded point starts a new trail segment (after a pause)
   wakeLock: null,
   wakeLockOk: false,
   error: null,
@@ -25,8 +26,9 @@ export const tracker = {
   get fix() { return state.fix; },
   get wakeLockOk() { return state.wakeLockOk; },
   get error() { return state.error; },
+  get paused() { return isPaused(state.run); },
   on(fn) { listeners.add(fn); return () => listeners.delete(fn); },
-  start, resume, end, logStop, logDump, undo, startWatch, stopWatch,
+  start, resume, end, logStop, logDump, undo, startWatch, stopWatch, pause, unpause, continueRun,
 };
 
 function emit(type, data) {
@@ -59,10 +61,11 @@ async function onFix(pos) {
   const fix = { lat: c.latitude, lng: c.longitude, acc: c.accuracy, spd: c.speed, t: pos.timestamp || Date.now() };
   state.fix = fix;
   emit('fix', fix);
-  if (!state.run || fix.acc > MAX_ACC_M) return;
+  if (!state.run || isPaused(state.run) || fix.acc > MAX_ACC_M) return;
   const last = state.points[state.points.length - 1];
-  if (last && haversine(last, fix) < MIN_MOVE_M && fix.t - last.t < MAX_GAP_MS) return;
+  if (last && !state.newSegment && haversine(last, fix) < MIN_MOVE_M && fix.t - last.t < MAX_GAP_MS) return;
   const point = { runId: state.run.id, ...fix };
+  if (state.newSegment) { point.seg = true; state.newSegment = false; }
   state.points.push(point);
   emit('point', point);
   try { await db.put('points', point); } catch (e) { console.error('save point', e); }
@@ -99,6 +102,52 @@ document.addEventListener('visibilitychange', async () => {
   }
 });
 
+function isPaused(run) {
+  const p = run?.pauses?.[run.pauses.length - 1];
+  return !!p && p.to == null;
+}
+
+/** Pause the clock (food, gas). GPS isn't recorded and the time doesn't count. */
+async function pause() {
+  const run = state.run;
+  if (!run || isPaused(run)) return;
+  run.pauses = run.pauses || [];
+  run.pauses.push({ from: Date.now(), to: null, kind: 'break' });
+  await saveRun();
+  emit('pause', true);
+}
+
+async function unpause() {
+  const run = state.run;
+  if (!isPaused(run)) return;
+  run.pauses[run.pauses.length - 1].to = Date.now();
+  state.newSegment = true;
+  await saveRun();
+  emit('pause', false);
+}
+
+/**
+ * Re-open a finished day (e.g. finish Tuesday's route Wednesday morning). The
+ * time in between is stored as an overnight pause so it doesn't count.
+ */
+async function continueRun(runId) {
+  if (state.run) throw new Error('Another route is in progress — end it first.');
+  const run = await db.get('runs', runId);
+  if (!run) throw new Error('Day not found');
+  run.pauses = run.pauses || [];
+  if (run.endedAt) run.pauses.push({ from: run.endedAt, to: Date.now(), kind: 'overnight' });
+  run.endedAt = null;
+  state.run = run;
+  state.points = (await db.byIndex('points', 'runId', runId)).sort((a, b) => a.t - b.t);
+  state.newSegment = true;
+  await saveRun();
+  await db.setSetting('activeRunId', run.id);
+  startWatch();
+  await requestWakeLock();
+  emit('run', run);
+  return run;
+}
+
 async function saveRun() {
   if (state.run) await db.put('runs', { ...state.run });
 }
@@ -107,6 +156,7 @@ async function start(routeId) {
   const run = { id: db.uid(), routeId, startedAt: Date.now(), endedAt: null, events: [], gaps: [] };
   state.run = run;
   state.points = [];
+  state.newSegment = false;
   if (state.fix && state.fix.acc <= MAX_ACC_M && Date.now() - state.fix.t < 60000) {
     const p = { runId: run.id, ...state.fix, t: Date.now() };
     state.points.push(p);
@@ -129,7 +179,7 @@ async function resume() {
   state.run = run;
   state.points = (await db.byIndex('points', 'runId', id)).sort((a, b) => a.t - b.t);
   const lastT = state.points.length ? state.points[state.points.length - 1].t : run.startedAt;
-  if (Date.now() - lastT > 60000) {
+  if (Date.now() - lastT > 60000 && !isPaused(run)) {
     run.gaps = run.gaps || [];
     run.gaps.push({ from: lastT, to: Date.now() });
   }
@@ -145,6 +195,7 @@ async function end() {
   const run = state.run;
   if (!run) return null;
   run.endedAt = Date.now();
+  if (isPaused(run)) run.pauses[run.pauses.length - 1].to = run.endedAt;
   delete run._hiddenAt;
   await saveRun();
   await db.setSetting('activeRunId', null);
@@ -173,6 +224,7 @@ async function logStop({ matchRadius = 25 } = {}) {
   if (!run) throw new Error('No route in progress');
   if (!pos) throw new Error('No GPS fix yet — wait a few seconds and try again');
 
+  await unpause(); // tapping STOP HERE means you're working again
   const visited = new Set(run.events.filter(e => e.stopId).map(e => e.stopId));
   const routeStops = await db.byIndex('stops', 'routeId', run.routeId);
   const pool = (await db.all('stops')).filter(s => s.routeId == null && s.lat != null);
@@ -204,6 +256,7 @@ async function logDump() {
   const pos = currentPosition();
   if (!run) throw new Error('No route in progress');
   if (!pos) throw new Error('No GPS fix yet — wait a few seconds and try again');
+  await unpause();
   const dumps = await db.getSetting('dumps', []);
   let site = nearest(pos, dumps, 400)?.item;
   if (!site) {

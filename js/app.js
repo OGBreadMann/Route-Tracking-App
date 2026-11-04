@@ -3,7 +3,7 @@
 
 import * as db from './db.js';
 import { tracker } from './tracker.js';
-import { runStats, fmtDuration, fmtMiles, serviceTimes, haversine } from './geo.js';
+import { runStats, fmtDuration, fmtMiles, serviceTimes, haversine, trackSegments, detectBreaks } from './geo.js';
 import { optimizeRoute, capacityFromRun } from './analysis.js';
 import { routeLine } from './matrix.js';
 import { parseCsv, rowsToCustomers, importCustomers } from './importer.js';
@@ -156,24 +156,30 @@ async function showActiveRun() {
   const mapEl = h('div.map.run-map');
   const nextCard = h('div.next-card');
   const stopBtn = h('button.btn.stop-btn', { onclick: onStop }, 'STOP HERE');
+  const resumeBtn = h('button.btn.stop-btn.resume-btn', { onclick: onResume }, '▶ RESUME');
+  const pauseBtn = h('button.btn.secondary', { onclick: onPause }, '⏸ Break');
+  const pausedBanner = h('div.paused-banner');
 
   show(
     h('div.run-head',
       h('div', h('strong', route?.name || 'Route'), h('div.muted.small', `Started ${fmtTime(run.startedAt)}`)),
       h('div.stats', h('div', elTime, h('small', 'time')), h('div', elMiles, h('small', 'miles')), h('div', elStops, h('small', 'stops'))),
       h('div.row.small', elGps, elWake)),
+    pausedBanner,
     plan ? nextCard : null,
     mapEl,
     h('div.run-actions',
       stopBtn,
-      h('div.row',
+      resumeBtn,
+      h('div.row.actions4',
         h('button.btn.secondary', { onclick: onDump }, '🗑️ Dump'),
+        pauseBtn,
         h('button.btn.secondary', { onclick: onUndo }, '↶ Undo'),
-        h('button.btn.secondary', { onclick: onEnd }, '■ End day'))),
+        h('button.btn.secondary', { onclick: onEnd }, '■ End'))),
   );
 
   const map = addMap(mapEl, { center: tracker.fix ? [tracker.fix.lat, tracker.fix.lng] : null, zoom: 16 });
-  const trail = L.polyline(tracker.points.map(p => [p.lat, p.lng]), { color: '#e2337f', weight: 5, opacity: 0.85 }).addTo(map);
+  const trail = L.polyline(trackSegments(tracker.points), { color: '#e2337f', weight: 5, opacity: 0.85 }).addTo(map);
   const me = L.marker([0, 0], { icon: meIcon(), interactive: false });
   const eventLayer = L.layerGroup().addTo(map);
   const planLayer = L.layerGroup().addTo(map);
@@ -240,6 +246,29 @@ async function showActiveRun() {
     const stats = runStats(run, tracker.points);
     elTime.textContent = fmtDuration(stats.totalS).replace(/ \d+s$/, '');
     elMiles.textContent = (stats.distanceM / 1609.344).toFixed(1);
+    const p = run.pauses?.at(-1);
+    if (tracker.paused) pausedBanner.textContent = `⏸ On break for ${fmtDuration((Date.now() - p.from) / 1000).replace(/ \d+s$/, '')} — this time isn’t counted. Tap RESUME when you’re back on the route.`;
+  }
+
+  function showPaused() {
+    const paused = tracker.paused;
+    stopBtn.hidden = paused;
+    resumeBtn.hidden = !paused;
+    pausedBanner.hidden = !paused;
+    pauseBtn.disabled = paused;
+    tick();
+  }
+
+  async function onPause() {
+    await tracker.pause();
+    showPaused();
+    toast('Break started — the clock is paused.');
+  }
+
+  async function onResume() {
+    await tracker.unpause();
+    showPaused();
+    toast('Back on the route.');
   }
 
   function onFix(fix) {
@@ -259,6 +288,7 @@ async function showActiveRun() {
     try {
       const r = await tracker.logStop({ matchRadius: s.matchRadius });
       stopById.set(r.stop.id, r.stop);
+      showPaused();
       navigator.vibrate?.(40);
       drawEvents(); drawPlan();
       const n = run.events.filter(e => e.type === 'stop').length;
@@ -277,6 +307,7 @@ async function showActiveRun() {
     try {
       const r = await tracker.logDump();
       s.dumps = await db.getSetting('dumps', []);
+      showPaused();
       drawEvents();
       toast(`Dump trip logged (${r.site.name})`);
     } catch (e) { toast(e.message); }
@@ -297,13 +328,13 @@ async function showActiveRun() {
     go('run', ended.id, { justEnded: true });
   }
 
-  drawEvents(); drawPlan(); tick(); wakeText(tracker.wakeLockOk);
+  drawEvents(); drawPlan(); showPaused(); wakeText(tracker.wakeLockOk);
   if (tracker.fix) onFix(tracker.fix);
   if (tracker.error) toast(tracker.error, [], 10000);
   const timer = setInterval(tick, 5000);
   const off = tracker.on((type, data) => {
     if (type === 'fix') onFix(data);
-    else if (type === 'point') trail.addLatLng([data.lat, data.lng]);
+    else if (type === 'point') trail.setLatLngs(trackSegments(tracker.points));
     else if (type === 'wakelock') wakeText(data);
     else if (type === 'error') toast(data, [], 10000);
     else if (type === 'gap') toast(`Tracking paused for ${fmtDuration((data.to - data.from) / 1000)} while the app was hidden.`, [], 6000);
@@ -378,7 +409,19 @@ async function showRoute(routeId) {
           `${fmtTime(r.startedAt)}–${fmtTime(r.endedAt)} · ${r.events.filter(e => e.type === 'stop').length} stops · ${r.events.filter(e => e.type === 'dump').length} dump trips`)),
         h('span.chev', '›')))),
     h('section.card',
-      h('h3', route.plan ? 'Stops (in suggested order)' : 'Stops'),
+      h('div.row', h('h3.grow', route.plan ? 'Stops (in suggested order)' : 'Stops'),
+        h('button.btn.small', {
+          onclick: async () => {
+            tracker.startWatch();
+            const last = sorted.findLast(x => x.lat != null);
+            const p = await pickLocation('Add a stop', { start: last || s.home, fix: () => tracker.fix || last || s.home });
+            if (!p) return;
+            const st = { id: db.uid(), routeId, ...p, name: '', address: '', note: '', active: true, source: 'manual', createdAt: Date.now() };
+            await db.put('stops', st);
+            await editStop(st);
+            go('route', routeId);
+          },
+        }, '+ Add stop')),
       ...sorted.map((st, i) => h('button.list-item', { onclick: async () => { if (await editStop(st)) go('route', routeId); } },
         h('div',
           h('strong', `${route.plan && order.has(st.id) ? `${order.get(st.id) + 1}. ` : ''}${st.name || st.address || `Stop (${st.lat?.toFixed(4)}, ${st.lng?.toFixed(4)})`}`),
@@ -477,45 +520,90 @@ function editStop(stop, { quick = false } = {}) {
 async function showRun(runId, { justEnded = false } = {}) {
   const run = await db.get('runs', runId);
   if (!run) return go('routes');
+  run.pauses = run.pauses || [];
   const route = await db.get('routes', run.routeId);
   const points = (await db.byIndex('points', 'runId', runId)).sort((a, b) => a.t - b.t);
   const stops = new Map((await db.byIndex('stops', 'routeId', run.routeId)).map(s => [s.id, s]));
+  const s = await settings.load();
   const stats = runStats(run, points);
-  const service = serviceTimes(run.events, points);
+  const service = serviceTimes(run.events, points, { pauses: run.pauses });
   const mapEl = h('div.map');
   const gapS = (run.gaps || []).reduce((a, g) => a + (g.to - g.from) / 1000, 0);
+  const breakS = run.pauses.filter(p => p.kind !== 'overnight').reduce((a, p) => a + (p.to - p.from) / 1000, 0);
 
+  // Long stationary periods away from any stop — probably food or gas.
+  const suggested = detectBreaks(points, {
+    stops: run.events.filter(e => e.type === 'stop'),
+    places: [s.home, ...s.dumps],
+    pauses: run.pauses,
+  });
+  const savePauses = async () => { await db.put('runs', run); go('run', runId); };
+  const markBreak = b => { run.pauses.push({ from: b.from, to: b.to, kind: 'break', detected: true }); };
+
+  // Timeline: stops, dump trips and breaks in time order.
   let n = 0;
+  const items = [
+    ...run.events.map(e => ({ t: e.t, e })),
+    ...run.pauses.map(p => ({ t: p.from, p })),
+  ].sort((a, b) => a.t - b.t);
+  const timeline = items.map(({ e, p }) => {
+    if (p) {
+      if (p.kind === 'overnight') return h('div.list-item.static.break-item', h('div', h('strong', `⏯ Continued ${fmtDate(p.to)} ${fmtTime(p.to)}`), h('div.muted.small', 'Time in between isn’t counted')));
+      return h('div.list-item.static.break-item',
+        h('div', h('strong', `${fmtTime(p.from)} ⏸ Break · ${fmtDuration((p.to - p.from) / 1000)}`), h('div.muted.small', 'Not counted in route time')),
+        h('button.btn.small.secondary', { onclick: async () => { run.pauses = run.pauses.filter(x => x !== p); await savePauses(); } }, 'Remove'));
+    }
+    if (e.type === 'dump') return h('div.list-item.static', h('div', h('strong', `${fmtTime(e.t)} 🗑️ Dump trip`)));
+    n++;
+    const st = stops.get(e.stopId);
+    const sv = service.get(e);
+    return h('button.list-item', { onclick: async () => { if (st && await editStop(st)) go('run', runId); } },
+      h('div', h('strong', `${fmtTime(e.t)} #${n} ${st?.name || st?.address || ''}`),
+        h('div.muted.small', [sv != null ? `stopped ${fmtDuration(sv)}` : '', st?.note].filter(Boolean).join(' · '))),
+      h('span.chev', '›'));
+  });
+
   show(
     h('button.back', { onclick: () => go('route', run.routeId) }, `‹ ${route?.name || 'Route'}`),
-    justEnded ? h('section.card.highlight', h('strong', 'Day saved! '), 'Record a few days of this route, then tap “Find the fastest route”.') : null,
+    justEnded ? h('section.card.highlight', h('strong', 'Day saved! '), 'Didn’t finish? Tap “Continue this day” next time instead of starting a new one. Once you have a full day, tap “Optimize this day”.') : null,
     h('section.card',
       h('h2', `${route?.name || 'Route'} — ${fmtDate(run.startedAt)}`),
       h('div.grid',
-        stat('Total time', fmtDuration(stats.totalS)),
+        stat('Route time', fmtDuration(stats.totalS)),
         stat('Miles', fmtMiles(stats.distanceM)),
         stat('Stops', stats.stops),
-        stat('Dump trips', stats.dumps),
+        stat('Driving', fmtDuration(stats.driveS)),
         stat('At stops', fmtDuration(stats.serviceS)),
-        stat('Avg per stop', fmtDuration(stats.avgServiceS))),
-      gapS > 60 ? h('p.warn.small', `GPS was paused for ${fmtDuration(gapS)} (app was in the background). Miles may be a little low.`) : null,
+        stat('Avg per stop', fmtDuration(stats.avgServiceS)),
+        stat('Dump trips', stats.dumps),
+        stat('Breaks', breakS ? fmtDuration(breakS) : '0')),
+      h('p.muted.small', 'Route time = driving + time at stops. Breaks and overnight time aren’t counted.'),
+      gapS > 60 ? h('p.warn.small', `GPS missed ${fmtDuration(gapS)} while the app was in the background. Miles may be a little low.`) : null,
       h('div.row',
         h('button.btn', { onclick: () => go('optimize', run.routeId, run.id) }, '⚡ Optimize this day'),
-        h('button.btn.secondary', { onclick: () => download(`route-${fmtDate(run.startedAt).replace(/\W+/g, '-')}.gpx`, toGpx(run, points, stops), 'application/gpx+xml') }, 'Export GPX'))),
+        h('button.btn.secondary', {
+          disabled: !!tracker.run,
+          onclick: async () => {
+            const ok = await confirmSheet('Continue this day?',
+              'Picks this day back up so you can finish the route — new stops get added to the same day. The time since you ended it won’t count.', 'Continue');
+            if (!ok) return;
+            try { await tracker.continueRun(runId); go('track'); } catch (e) { toast(e.message); }
+          },
+        }, '▶ Continue this day')),
+      h('button.btn.secondary.small', { style: { marginTop: '8px' }, onclick: () => download(`route-${fmtDate(run.startedAt).replace(/\W+/g, '-')}.gpx`, toGpx(run, points, stops), 'application/gpx+xml') }, 'Export GPX')),
+    suggested.length ? h('section.card.highlight',
+      h('h3', `Possible breaks found (${suggested.length})`),
+      h('p.small', 'The truck sat still here for a while, away from any stop. If these were food or gas breaks, mark them so they don’t count toward route time.'),
+      ...suggested.map(b => h('div.list-item.static',
+        h('div', h('strong', `${fmtTime(b.from)}–${fmtTime(b.to)} · ${fmtDuration((b.to - b.from) / 1000)}`),
+          h('a.small', { href: `https://maps.apple.com/?ll=${b.lat},${b.lng}&q=Break`, target: '_blank', rel: 'noopener' }, 'See where')),
+        h('button.btn.small', { onclick: async () => { markBreak(b); await savePauses(); } }, 'Mark as break'))),
+      suggested.length > 1 ? h('button.btn.secondary', { onclick: async () => { suggested.forEach(markBreak); await savePauses(); } }, 'Mark all as breaks') : null) : null,
     mapEl,
     h('section.card',
       h('h3', 'Timeline'),
       h('div.list-item.static', h('div', h('strong', `${fmtTime(run.startedAt)} Start`))),
-      ...run.events.map(e => {
-        if (e.type === 'dump') return h('div.list-item.static', h('div', h('strong', `${fmtTime(e.t)} 🗑️ Dump trip`)));
-        n++;
-        const st = stops.get(e.stopId);
-        const sv = service.get(e);
-        return h('button.list-item', { onclick: async () => { if (st && await editStop(st)) go('run', runId); } },
-          h('div', h('strong', `${fmtTime(e.t)} #${n} ${st?.name || st?.address || ''}`),
-            h('div.muted.small', [sv != null ? `stopped ${fmtDuration(sv)}` : '', st?.note].filter(Boolean).join(' · '))),
-          h('span.chev', '›'));
-      }),
+      ...timeline,
       h('div.list-item.static', h('div', h('strong', `${fmtTime(run.endedAt)} End`)))),
     h('section.card',
       h('button.btn.danger.secondary', {
@@ -528,14 +616,15 @@ async function showRun(runId, { justEnded = false } = {}) {
   );
 
   const map = addMap(mapEl);
-  const line = points.map(p => [p.lat, p.lng]);
-  if (line.length) L.polyline(line, { color: '#e2337f', weight: 4 }).addTo(map);
+  const segs = trackSegments(points);
+  if (segs.length) L.polyline(segs, { color: '#e2337f', weight: 4 }).addTo(map);
   n = 0;
   for (const e of run.events) {
     if (e.type === 'stop') L.marker([e.lat, e.lng], { icon: numberIcon(++n) }).bindPopup(stops.get(e.stopId)?.name || `Stop ${n}`).addTo(map);
     else L.marker([e.lat, e.lng], { icon: placeIcon('dump') }).addTo(map);
   }
-  fitTo(map, [...line, ...run.events.map(e => [e.lat, e.lng])]);
+  for (const b of suggested) L.marker([b.lat, b.lng], { icon: placeIcon('break') }).bindPopup(`Possible break · ${fmtDuration((b.to - b.from) / 1000)}`).addTo(map);
+  fitTo(map, [...segs.flat(), ...run.events.map(e => [e.lat, e.lng])]);
 }
 
 function stat(label, value) {

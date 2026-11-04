@@ -213,3 +213,15 @@ ol.plan-list a { color: var(--pink); }
   border-bottom: 1px solid var(--line); color: inherit; font-size: 14px;
 }
 .next-card .btn { flex: none; }
+.actions4 { flex-wrap: nowrap; gap: 6px; }
+.actions4 .btn { padding: 12px 4px; font-size: 14px; white-space: nowrap; }
+.resume-btn { background: #f0a020; box-shadow: 0 4px 0 #b97200; }
+.resume-btn:active { background: #d88c10; box-shadow: 0 1px 0 #b97200; }
+.paused-banner {
+  background: #fff4dc; color: #7a4b00; border-radius: 14px; padding: 10px 14px; margin-bottom: 8px;
+  font-weight: 600; font-size: 14px;
+}
+@media (prefers-color-scheme: dark) { .paused-banner { background: #3a2a08; color: #ffd98a; } }
+[hidden] { display: none !important; }
+.break-item strong { color: var(--warn); }
+.list-item.static .btn { flex: none; }

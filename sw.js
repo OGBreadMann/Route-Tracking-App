@@ -1,6 +1,6 @@
 // Offline support: the app itself works with no signal (rural roads!). Map tiles
 // and drive-time lookups still need a connection; tiles you've seen are cached.
-const VERSION = 'v1';
+const VERSION = 'v2';
 const APP = `app-${VERSION}`;
 const TILES = 'tiles';
 const SHELL = [
