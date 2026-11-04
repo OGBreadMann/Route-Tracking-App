@@ -3,6 +3,7 @@
 
 import * as db from './db.js';
 import { geocode } from './ui.js';
+import { nearest } from './geo.js';
 
 export function parseCsv(text) {
   const rows = [];
@@ -115,4 +116,63 @@ export async function importCustomers(customers, { onProgress = () => {}, signal
     onProgress(i + 1, customers.length);
   }
   return stats;
+}
+
+// ---------------------------------------------------------------- GPX restore
+
+/** Read a GPX file (ours, or any app's): waypoints become stops/dumps, the track becomes the trail. */
+export function parseGpx(text) {
+  const attr = (s, k) => parseFloat((s.match(new RegExp(`\\b${k}="([^"]+)"`)) || [])[1]);
+  const tag = (s, k) => (s.match(new RegExp(`<${k}>([\\s\\S]*?)</${k}>`)) || [])[1];
+  const unxml = s => (s || '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+  const wpts = [...text.matchAll(/<wpt\b([^>]*)>([\s\S]*?)<\/wpt>/g)].map(m => ({
+    lat: attr(m[1], 'lat'), lng: attr(m[1], 'lon'), t: Date.parse(tag(m[2], 'time')), name: unxml(tag(m[2], 'name')).trim(),
+  })).filter(w => isFinite(w.lat) && isFinite(w.lng) && isFinite(w.t)).sort((a, b) => a.t - b.t);
+  const points = [...text.matchAll(/<trkpt\b([^>]*)>([\s\S]*?)<\/trkpt>/g)].map(m => ({
+    lat: attr(m[1], 'lat'), lng: attr(m[1], 'lon'), t: Date.parse(tag(m[2], 'time')),
+  })).filter(p => isFinite(p.lat) && isFinite(p.lng) && isFinite(p.t)).sort((a, b) => a.t - b.t);
+  return { wpts, points };
+}
+
+/**
+ * Save a parsed GPX as a recorded day on the named route (created if needed).
+ * Waypoints at saved stops of that route reuse those stops.
+ */
+export async function importGpxDay({ wpts, points }, routeName, { matchRadius = 25 } = {}) {
+  if (!wpts.length && !points.length) throw new Error('No stops or GPS trail found in that file.');
+  const routes = await db.all('routes');
+  let route = routes.find(r => r.name.trim().toLowerCase() === routeName.trim().toLowerCase());
+  if (!route) { route = { id: db.uid(), name: routeName.trim(), createdAt: Date.now() }; await db.put('routes', route); }
+
+  const times = [...wpts, ...points].map(x => x.t);
+  const startedAt = Math.min(...times), endedAt = Math.max(...times);
+  const existing = await db.byIndex('runs', 'routeId', route.id);
+  const dup = existing.find(r => r.startedAt === startedAt);
+  if (dup) return { runId: dup.id, duplicate: true };
+
+  const routeStops = await db.byIndex('stops', 'routeId', route.id);
+  const dumps = await db.getSetting('dumps', []);
+  const runId = db.uid();
+  const events = [], used = new Set(), newStops = [];
+  for (const w of wpts) {
+    if (/^dump\b/i.test(w.name)) {
+      let site = nearest(w, dumps, 400)?.item;
+      if (!site) { site = { id: db.uid(), name: `Dump site ${dumps.length + 1}`, lat: w.lat, lng: w.lng }; dumps.push(site); }
+      events.push({ type: 'dump', dumpId: site.id, lat: w.lat, lng: w.lng, t: w.t });
+      continue;
+    }
+    const name = w.name.replace(/^#\d+\s*/, '');
+    let stop = nearest(w, routeStops.filter(s => !used.has(s.id) && s.active !== false), matchRadius)?.item;
+    if (!stop) {
+      stop = { id: db.uid(), routeId: route.id, lat: w.lat, lng: w.lng, name, address: '', note: '', active: true, source: 'gpx', createdAt: w.t };
+      routeStops.push(stop); newStops.push(stop);
+    }
+    used.add(stop.id);
+    events.push({ type: 'stop', stopId: stop.id, lat: w.lat, lng: w.lng, t: w.t });
+  }
+  await db.putMany('stops', newStops);
+  await db.setSetting('dumps', dumps);
+  await db.putMany('points', points.map(p => ({ runId, lat: p.lat, lng: p.lng, t: p.t, acc: null })));
+  await db.put('runs', { id: runId, routeId: route.id, startedAt, endedAt, events, gaps: [], pauses: [], imported: true });
+  return { runId, duplicate: false, stops: events.filter(e => e.type === 'stop').length, newStops: newStops.length };
 }

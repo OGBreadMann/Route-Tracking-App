@@ -6,7 +6,7 @@ import { tracker } from './tracker.js';
 import { runStats, fmtDuration, fmtMiles, serviceTimes, haversine, trackSegments, detectBreaks } from './geo.js';
 import { optimizeRoute, capacityFromRun } from './analysis.js';
 import { routeLine } from './matrix.js';
-import { parseCsv, rowsToCustomers, importCustomers } from './importer.js';
+import { parseCsv, rowsToCustomers, importCustomers, parseGpx, importGpxDay } from './importer.js';
 import {
   h, toast, sheet, confirmSheet, promptSheet, makeMap, numberIcon, placeIcon, meIcon, fitTo,
   appleMapsUrl, pickLocation, download, fmtDate, fmtTime,
@@ -811,6 +811,7 @@ async function showSettings() {
   radius.addEventListener('change', async () => { await db.setSetting('matchRadius', Math.max(5, +radius.value || 25)); toast('Saved'); });
   const fileIn = h('input', { type: 'file', accept: '.json,application/json', style: { display: 'none' } });
   const csvIn = h('input', { type: 'file', accept: '.csv,text/csv', style: { display: 'none' } });
+  const gpxIn = h('input', { type: 'file', style: { display: 'none' } }); // no accept filter: iOS greys out .gpx otherwise
 
   const place = (p) => p ? `${p.lat.toFixed(5)}, ${p.lng.toFixed(5)}` : 'Not set';
 
@@ -861,6 +862,11 @@ async function showSettings() {
       h('label', 'Stop matching distance (meters)', radius),
       h('p.muted.small', 'When you tap STOP HERE within this distance of a saved stop, it counts as a visit to that stop instead of creating a new one. Raise it if houses are far apart and GPS is jumpy; lower it if houses are close together.')),
     h('section.card',
+      h('h2', 'Restore a day from GPX'),
+      h('p.small', 'Lost a day? If you exported it with “Export GPX”, pick that file here to put the day (stops + GPS trail) back on its route.'),
+      gpxIn,
+      h('button.btn.secondary', { onclick: () => gpxIn.click() }, 'Restore day from GPX file')),
+    h('section.card',
       h('h2', 'Backup'),
       h('p.small', 'Everything is stored only on this phone. Export a backup now and then (save to Files / iCloud Drive) so nothing is lost if Safari data is cleared.'),
       h('div.row',
@@ -893,6 +899,25 @@ async function showSettings() {
       await db.importAll(data, { replace });
       toast('Backup restored'); go('settings');
     } catch (e) { toast(`Couldn’t restore: ${e.message}`); }
+  });
+
+  gpxIn.addEventListener('change', async () => {
+    const f = gpxIn.files[0];
+    gpxIn.value = '';
+    if (!f) return;
+    try {
+      const parsed = parseGpx(await f.text());
+      if (!parsed.wpts.length && !parsed.points.length) return toast('That file has no GPS data.');
+      const day = WEEKDAYS[new Date(parsed.points[0]?.t ?? parsed.wpts[0].t).getDay()];
+      const routes = await db.all('routes');
+      const guess = routes.find(r => r.name.toLowerCase().includes(day.toLowerCase()))?.name || day;
+      const name = await promptSheet('Which route was this?',
+        `Found ${parsed.wpts.length} stops and ${parsed.points.length.toLocaleString()} GPS points from ${fmtDate(parsed.points[0]?.t ?? parsed.wpts[0].t)}. Route name:`, guess, 'Restore');
+      if (!name) return;
+      const res = await importGpxDay(parsed, name, { matchRadius: s.matchRadius });
+      toast(res.duplicate ? 'That day is already here.' : `Restored ${res.stops} stops.`);
+      go('run', res.runId);
+    } catch (e) { toast(`Couldn’t read that file: ${e.message}`); }
   });
 
   csvIn.addEventListener('change', async () => {
