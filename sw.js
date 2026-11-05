@@ -1,6 +1,6 @@
 // Offline support: the app itself works with no signal (rural roads!). Map tiles
 // and drive-time lookups still need a connection; tiles you've seen are cached.
-const VERSION = 'v4';
+const VERSION = 'v5';
 const APP = `app-${VERSION}`;
 const TILES = 'tiles';
 const SHELL = [
@@ -36,9 +36,11 @@ self.addEventListener('fetch', e => {
   }
 
   if (url.origin === location.origin) {
-    // Network first so updates show up, cache fallback for no signal.
-    e.respondWith(fetch(e.request).then(res => {
-      if (res.ok) caches.open(APP).then(c => c.put(e.request, res.clone()));
+    // Network first so updates show up, cache fallback for no signal. 'no-cache'
+    // makes the phone check with the server every time instead of reusing a
+    // copy for up to 10 minutes (cheap: unchanged files come back as 304).
+    e.respondWith(fetch(e.request, { cache: 'no-cache' }).then(res => {
+      if (res.status === 200) caches.open(APP).then(c => c.put(e.request, res.clone())).catch(() => {});
       return res;
     }).catch(() => caches.match(e.request, { ignoreSearch: true })));
   }

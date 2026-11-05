@@ -61,6 +61,9 @@ const settings = {
   },
 };
 
+// Bump together with VERSION in sw.js; shown in Settings so it's easy to tell what's running.
+const APP_VERSION = 5;
+
 const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
 async function routeName(id) {
@@ -892,7 +895,7 @@ async function showSettings() {
           await db.wipeAll(); go('settings');
         },
       }, 'Erase all data')),
-    h('p.muted.small.center', 'Maps © OpenStreetMap contributors · Drive times by OSRM'),
+    h('p.muted.small.center', `App version ${APP_VERSION} · Maps © OpenStreetMap contributors · Drive times by OSRM`),
   );
 
   fileIn.addEventListener('change', async () => {
@@ -951,7 +954,18 @@ async function showSettings() {
 
 (async function boot() {
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
-    navigator.serviceWorker.register('sw.js').catch(e => console.warn('SW', e));
+    // Always check for a new version when the app opens or comes back on screen,
+    // and reload into it as soon as it's installed (a route in progress resumes).
+    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(reg => {
+      document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); });
+    }).catch(e => console.warn('SW', e));
+    const hadController = !!navigator.serviceWorker.controller;
+    let reloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadController || reloaded) return;
+      reloaded = true;
+      location.reload();
+    });
   }
   if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
   const resumed = await tracker.resume();
