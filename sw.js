@@ -1,12 +1,12 @@
 // Offline support: the app itself works with no signal (rural roads!). Map tiles
 // and drive-time lookups still need a connection; tiles you've seen are cached.
-const VERSION = 'v3';
+const VERSION = 'v4';
 const APP = `app-${VERSION}`;
 const TILES = 'tiles';
 const SHELL = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css',
   'js/app.js', 'js/db.js', 'js/geo.js', 'js/tracker.js', 'js/ui.js', 'js/optimizer.js',
-  'js/matrix.js', 'js/analysis.js', 'js/importer.js',
+  'js/matrix.js', 'js/analysis.js', 'js/importer.js', 'js/keepawake-video.js',
   'vendor/leaflet/leaflet.js', 'vendor/leaflet/leaflet.css',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png',
 ];

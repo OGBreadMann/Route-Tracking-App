@@ -111,6 +111,7 @@ async function showTrack() {
 }
 
 async function beginRun(routeId, today) {
+  tracker.primeKeepAwake(); // must happen inside the tap, before any await
   if (routeId === '__new') {
     const name = await promptSheet('New route', 'Name it (you can rename later)', `${today} route`, 'Create');
     if (!name) return;
@@ -152,7 +153,10 @@ async function showActiveRun() {
   const plan = route?.plan;
 
   const elTime = h('b', '0m'), elMiles = h('b', '0'), elStops = h('b', '0'), elGps = h('span.gps', 'GPS…');
-  const elWake = h('span.small');
+  // Tapping this re-arms keep-awake (via the global tap handler in tracker.js).
+  const elWake = h('span.small', { onclick: () => setTimeout(() => {
+    if (!tracker.wakeLockOk) toast('Still can’t keep the screen on. If the battery icon is yellow, turn off Low Power Mode — or set Auto-Lock to Never for today.', [], 8000);
+  }, 1500) });
   const mapEl = h('div.map.run-map');
   const nextCard = h('div.next-card');
   const stopBtn = h('button.btn.stop-btn', { onclick: onStop }, 'STOP HERE');
@@ -280,7 +284,8 @@ async function showActiveRun() {
   }
 
   function wakeText(ok) {
-    elWake.textContent = ok ? '· Screen stays on ✓' : '· ⚠ Screen may sleep — set Auto-Lock to Never';
+    elWake.textContent = ok ? '· Screen stays on ✓' : '· ⚠ Screen may sleep — tap here to fix';
+    elWake.classList.toggle('warn-btn', !ok);
   }
 
   async function onStop() {

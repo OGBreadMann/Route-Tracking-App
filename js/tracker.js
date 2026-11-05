@@ -3,6 +3,7 @@
 
 import * as db from './db.js';
 import { haversine, nearest } from './geo.js';
+import { KEEP_AWAKE_MP4 } from './keepawake-video.js';
 
 const MIN_MOVE_M = 6;        // record a point when moved this far...
 const MAX_GAP_MS = 20000;    // ...or this long since the last recorded point
@@ -24,7 +25,8 @@ export const tracker = {
   get run() { return state.run; },
   get points() { return state.points; },
   get fix() { return state.fix; },
-  get wakeLockOk() { return state.wakeLockOk; },
+  get wakeLockOk() { return awake(); },
+  primeKeepAwake,
   get error() { return state.error; },
   get paused() { return isPaused(state.run); },
   on(fn) { listeners.add(fn); return () => listeners.delete(fn); },
@@ -71,17 +73,82 @@ async function onFix(pos) {
   try { await db.put('points', point); } catch (e) { console.error('save point', e); }
 }
 
-async function requestWakeLock() {
+// ---- keeping the screen on -------------------------------------------------
+// Two methods together: the Wake Lock API (Safari 16.4+, home-screen apps from
+// iOS 18.4) and a tiny muted looping video (iPhones don't auto-lock during
+// video). iOS only allows either to start reliably from a tap, so every tap
+// during a route re-arms them if they were dropped.
+
+let video = null;
+function keepAwakeVideo() {
+  if (video) return video;
+  video = document.createElement('video');
+  video.src = KEEP_AWAKE_MP4;
+  video.muted = true;
+  video.loop = true;
+  video.playsInline = true;
+  for (const a of ['muted', 'playsinline', 'webkit-playsinline']) video.setAttribute(a, '');
+  video.setAttribute('aria-hidden', 'true');
+  Object.assign(video.style, { position: 'fixed', left: '0', bottom: '0', width: '1px', height: '1px', opacity: '0.01', pointerEvents: 'none', zIndex: '-1' });
+  video.addEventListener('playing', () => emit('wakelock', awake()));
+  video.addEventListener('pause', () => emit('wakelock', awake()));
+  document.body.append(video);
+  return video;
+}
+
+function awake() {
+  return state.wakeLockOk || (!!video && !video.paused);
+}
+
+/** Start the video synchronously (must run inside a tap handler on iOS). */
+function startVideo() {
   try {
-    if ('wakeLock' in navigator && document.visibilityState === 'visible') {
-      state.wakeLock = await navigator.wakeLock.request('screen');
+    const p = keepAwakeVideo().play();
+    p?.catch?.(() => emit('wakelock', awake()));
+  } catch {}
+}
+
+async function requestWakeLock() {
+  startVideo();
+  try {
+    if ('wakeLock' in navigator && document.visibilityState === 'visible' && !state.wakeLock) {
+      const lock = await navigator.wakeLock.request('screen');
+      state.wakeLock = lock;
       state.wakeLockOk = true;
-      state.wakeLock.addEventListener('release', () => { state.wakeLockOk = false; emit('wakelock', false); });
+      lock.addEventListener('release', () => {
+        if (state.wakeLock === lock) state.wakeLock = null;
+        state.wakeLockOk = false;
+        emit('wakelock', awake());
+      });
     }
   } catch (e) {
     state.wakeLockOk = false;
   }
-  emit('wakelock', state.wakeLockOk);
+  emit('wakelock', awake());
+}
+
+async function releaseWakeLock() {
+  try { await state.wakeLock?.release(); } catch {}
+  state.wakeLock = null;
+  state.wakeLockOk = false;
+  video?.pause();
+  emit('wakelock', false);
+}
+
+/**
+ * Call at the very start of the "Start Route" tap, before any await, so iOS
+ * counts it as user-initiated. Stops again if no route actually starts.
+ */
+function primeKeepAwake() {
+  startVideo();
+  setTimeout(() => { if (!state.run) video?.pause(); }, 60000);
+}
+
+// Any tap during a route re-arms keep-awake if iOS dropped it.
+for (const type of ['touchend', 'click']) {
+  document.addEventListener(type, () => {
+    if (state.run && (!state.wakeLockOk || !video || video.paused)) requestWakeLock();
+  }, { capture: true, passive: true });
 }
 
 document.addEventListener('visibilitychange', async () => {
@@ -199,9 +266,8 @@ async function end() {
   delete run._hiddenAt;
   await saveRun();
   await db.setSetting('activeRunId', null);
-  try { await state.wakeLock?.release(); } catch {}
-  state.wakeLock = null;
   state.run = null;
+  await releaseWakeLock();
   emit('run', null);
   return run;
 }

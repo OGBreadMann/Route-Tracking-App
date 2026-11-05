@@ -225,3 +225,4 @@ ol.plan-list a { color: var(--pink); }
 [hidden] { display: none !important; }
 .break-item strong { color: var(--warn); }
 .list-item.static .btn { flex: none; }
+.warn-btn { color: var(--warn); font-weight: 700; text-decoration: underline; cursor: pointer; }
